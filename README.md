@@ -1,100 +1,122 @@
-# `sysupd` — a Linux DDoS booter wearing Torii's clothes
+# `sysupd` — a Mirai booter in Torii's clothes
 
-**TL;DR.** A bespoke, C-written Linux **DDoS booter** caught in a honeypot. MalwareBazaar labels it
-**Torii** — it isn't. Classic Torii (Avast, 2018) was a *Go* stealth-exfil RAT with **no DDoS**. This sample
-is a Mirai-class flooder (UDP + raw-socket spoofed TCP SYN/ACK) that merely *borrows* Torii's aggressive
-multi-init **"sysupd"** persistence — which is almost certainly why the AV signature misfires. Detection was
-low (15/74) at capture. Shape-labelled **`sysupd-booter`**.
+**TL;DR.** A Linux **DDoS booter** caught in a honeypot. MalwareBazaar labels it **Torii** — it isn't.
+Under the hood it's **Mirai-lineage**: it keeps Mirai's single-instance lock and multi-arch spoofed-flood
+engine, but has had the scanner and config system **stripped out**, a **bespoke plaintext C2 protocol** bolted
+on, and **Torii-style "sysupd" persistence** grafted over the top. The "Torii" name comes from that
+persistence, not from the code's actual lineage. Detection was low (15/74) at capture. Shape-labelled
+**`sysupd-booter`**.
 
-Everything below is from static analysis of the captured binary. Nothing was executed.
+Analysis below is static RE **plus a contained dynamic detonation** (packet captures of every attack method).
+Nothing was run outside an isolated, no-egress lab.
 
 ---
 
-## Not Torii — why the label is wrong
+## Lineage: Mirai, not Torii
 
-| | Classic Torii (2018) | This sample |
+The giveaway is at runtime: the bot does **`bind(127.0.0.1:48101)`** — Mirai's canonical single-instance lock
+port, inherited from the leaked source, not a number you pick by accident. Add the fork-per-attack worker
+model, the duration-bounded attack children, and the raw-socket spoofed SYN/ACK flood with hand-built headers
++ checksums, and the attack engine is clearly Mirai-derived.
+
+What was changed — which is why it doesn't *look* like Mirai to a signature:
+
+| | Stock Mirai | This sample |
 |---|---|---|
-| Language | Go | **C** (GCC 4.1.2, static) |
-| C2 comms | multi-layer encrypted | **plaintext** bespoke binary protocol |
-| Purpose | stealth data-exfil RAT, modular | **pure DDoS booter** |
-| DDoS | none | UDP + raw-socket spoofed TCP floods |
-| Shared | — | the **"sysupd" multi-init persistence** |
+| Single-instance lock | `127.0.0.1:48101` | **`127.0.0.1:48101`** (kept) |
+| Attack engine | UDP + raw-socket floods | **kept** (UDP ×3 + spoofed TCP SYN/ACK ×2) |
+| C2 protocol | `\x00\x00\x00\x01`+id, XOR config table | **replaced** — bespoke plaintext (below) |
+| Scanner / telnet spread | yes | **removed** |
+| Persistence | minimal (memory-resident) | **Torii-style multi-init "sysupd"** |
 
-The *only* real overlap is the persistence suite. That's the lesson: an AV signature keyed on persistence
-strings will happily paste a famous family name onto an unrelated bot. Label by **capability**, not by
-install artefacts.
+And it's **not Torii** either: real Torii (Avast, 2018) was a **Go** stealth data-exfil RAT with encrypted
+comms and **no DDoS**. The only thing shared with Torii is the aggressive persistence — which is exactly what
+the AV signature keyed on. Label by capability, not by install strings.
 
----
+## The bespoke-but-plaintext C2 — and why
 
-## The registration beacon (the fun part)
+The author replaced Mirai's C2 with their own protocol, yet left it entirely in the clear. That's not a
+contradiction once you read "bespoke" as *minimal and self-owned*, not *sophisticated*:
 
-On connect the bot sends a fixed-shape beacon:
+- Obfuscating the C2 (Mirai's XOR config table) is mostly theatre — the bot **must** connect to its C2, so any
+  sandbox run reveals the address regardless. XOR only beats a lazy `strings`.
+- The evasion here is **novelty, not crypto** — 15/74 on a fresh codebase, *with* a plaintext protocol. No
+  signatures exist yet, so plaintext costs nothing.
+- A plaintext, 3-opcode protocol is **easy to operate** — a trivial C2 server, no key management, no crypto bugs.
+
+It reads as a booter operator optimising for simplicity and control, not a malware author optimising for
+stealth. The one custom flourish — the CPU-count byte in the beacon — is an *operational* optimisation, not an
+evasion one.
+
+### Registration beacon
 
 ```
 A1 71 4E 01 02 | <nproc> | <hostlen> | <hostname…>
-   5-byte magic   1 byte     1 byte     N bytes
+   5-byte magic   1 byte     1 byte      N bytes
 ```
 
-The byte right after the 5-byte magic is the infected host's **CPU count**
-(`sysconf(_SC_NPROCESSORS_ONLN)`). The operator harvests per-bot core counts *at check-in* — a crude way to
-gauge each bot's flood capacity before tasking it. Uncommon, and a clean network fingerprint.
+The byte after the magic is the host's **CPU count** (`sysconf(_SC_NPROCESSORS_ONLN)`) — the operator gauges
+each bot's flood capacity at check-in.
 
----
+### Framing & opcodes
 
-## Protocol
+`[type u8][length u16 BE][body]`, length ≤ 2048, **length 0 = keepalive**.
 
-Framing (server → bot): `[type u8][length u16 BE][body]`, length capped at 2048, **length 0 = keepalive**.
-Just three opcodes:
+- `0x01` **ping** → bot replies `02 00 00` (pong). The only keepalive; CNC-driven.
+- `0x10` **launch** (body below).
+- `0x11` **stop** → by attack-key IP; `FF FF FF FF` = stop all.
 
-- **`0x01` ping** → bot replies `02 00 00` (pong). The only keepalive; the bot never self-initiates one.
-- **`0x10` launch attack** → body = target IPv4 + duration (clamped ≤ 3600 s) + port + method (1–5) +
-  optional payload (≤ 1024 B). The bot `fork()`s a child per attack and tracks up to **256 concurrent
-  attacks** in a table keyed by target IP (killing any prior child on the same target first).
-- **`0x11` stop** → by target IP; `0xFFFFFFFF` = stop everything. Classic booter ergonomics.
+### `0x10` launch body (15-byte header, confirmed on-wire)
 
----
+```
+[0:4]   attack-key IPv4     (handle used by 0x11 STOP-by-target)
+[4]     method (1–5)
+[5:7]   duration (BE, 1–3600 s)
+[7:11]  flood-destination IPv4
+[11:13] destination port (BE)
+[13:15] payload length (BE, ≤1024)
+[15:]   payload
+```
 
-## Attack methods (5)
+Note the **two IP fields** — an attack handle (for `0x11` stop) and the actual flood target. (An easy field to
+misread from static analysis alone; the lab run pinned it.)
 
-- **Methods 1–3 — UDP flood.** `SOCK_DGRAM`, 1 MB send buffer, fixed or per-packet-random destination
-  port, payload either attacker-supplied or ~1400 B of randomness.
-- **Methods 4–5 — raw-socket TCP flood.** `SOCK_RAW` + `IP_HDRINCL`, hand-built IP/TCP headers, **spoofed
-  random source IP** per packet, randomised sequence numbers, internet checksums computed in-binary
-  (SYN / ACK variants).
+## Attack methods (observed on the wire)
 
-Strictly L3/L4 volumetric. **No HTTP/L7 method.**
+- **1 — UDP, random volumetric:** randomised packet sizes (≈560–1400 B); ignores any supplied payload.
+- **2 — UDP, fixed:** 16-byte payload.
+- **3 — UDP, operator payload:** sends the attacker-supplied payload verbatim.
+- **4 — TCP SYN flood, spoofed:** `SOCK_RAW` + `IP_HDRINCL`, hand-built IP/TCP headers, **source IP randomised
+  per packet** (~83k distinct sources across ~84k packets — effectively unique-per-packet, full range).
+- **5 — TCP ACK flood, spoofed:** same raw path, ACK instead of SYN.
+
+Each method forks multiple flood workers. Strictly L3/L4 volumetric — **no HTTP/L7 method**.
 
 ## What it does *not* do
 
 No scanner/propagation, no proxy/relay, no data-exfil command, no shell/exec over C2, no loader or
-self-update. `execve` appears **only** in the startup persistence installer, never in the command loop.
-It is a single-purpose flooder.
-
----
+self-update. `execve` appears **only** in the startup persistence installer. A single-purpose flooder.
 
 ## Persistence
 
-Masquerades as **`sysupd`** / **`.sysupd`** ("system update") and installs itself via *every* mechanism it
-can, run all at once at first launch:
+The running process masquerades as **`udhcpc`**, and installs a self-copy (`/usr/bin/.sysupd`, byte-identical
+to the sample) as **`sysupd`** via every mechanism at once:
 
-- systemd unit (`sysupd.service`)
-- SysV `init.d` (`/etc/init.d/sysupd` + `S90sysupd`)
-- OpenRC
-- cron: `/etc/cron.d/sysupd`, a `@reboot` crontab line, and a `*/5 * * * *` respawn
+- systemd unit (`sysupd.service`, `Restart=always`)
+- SysV `init.d` (`/etc/init.d/sysupd` + `S90sysupd`), OpenRC
+- cron: `/etc/cron.d/sysupd`, a `@reboot` line, and a `*/5 * * * *` **root respawn**
 - `/etc/profile.d/sysupd.sh`, `~/.bashrc`, `~/.profile`
-- XDG autostart `.desktop`
-- `rc.local`
+- XDG autostart `.desktop`, `rc.local`
 
-It also opens `/dev/watchdog` (IoT anti-reboot). Respawn-shell pidfile: `/tmp/.ash.pid`.
+It also opens `/dev/watchdog` (IoT anti-reboot). Respawn pidfile: `/tmp/.ash.pid`.
 
----
+## Analyst note — a *verified* false-positive
 
-## Analyst note — one red herring
-
-A 128-byte high-entropy blob in `.data` looks like an embedded key/config. It's **glibc's `randtbl` PRNG
-state** (`TYPE_3` marker + 31 seed words). Don't waste time on it.
-
----
+A 128-byte high-entropy blob in `.data` (`0x50f3a0`) looks like a key or encrypted config, but it's glibc's
+static **`randtbl`** PRNG initial-state table: the first word is `TYPE_3`, the 128 bytes are byte-for-byte
+identical to upstream glibc, and the region is referenced *only* by the statically-linked `random_r` machinery
+— glibc's `struct random_data` pointers (`state`/`fptr`/`rptr`/`end_ptr`) walk exactly this array. A benign
+libc artefact, flagged here because it's an easy false-positive when you're hunting for a config key.
 
 ## Detection
 
@@ -110,8 +132,10 @@ alert tcp any any -> any any ( \
 
 **Host IOCs:**
 
-- Names / paths: `sysupd`, `.sysupd`, `/etc/init.d/sysupd`, `/etc/cron.d/sysupd`,
-  `/etc/profile.d/sysupd.sh`, `/tmp/.ash.pid`
+- Masquerades: process `udhcpc`; install name `sysupd` / `.sysupd`
+- Paths: `/usr/bin/.sysupd`, `/etc/init.d/sysupd`, `/etc/cron.d/sysupd`, `/etc/profile.d/sysupd.sh`,
+  `sysupd.service`, `/tmp/.ash.pid`
+- Single-instance lock: `bind 127.0.0.1:48101` (Mirai heritage)
 - Beacon magic: `A1 71 4E 01 02`
 
 **Sample:**
@@ -121,15 +145,14 @@ alert tcp any any -> any any ( \
 
 **C2 omitted** — the live infrastructure is still active and under observation.
 
----
-
 ## Naming
 
-No self-ID, version, or author strings in the binary. Named **`sysupd-booter`** after its persistence
-artefact (shape-based). No primary source attributes these TTPs to a named family, and the single AV label
-present ("Torii") is contradicted by the capability set — so it gets a descriptive name, not a borrowed one.
+No self-ID, version, or author strings in the binary. Named **`sysupd-booter`** after its persistence artefact
+(shape-based). It's **Mirai-lineage by code** (the `48101` lock + the attack engine) but with a bespoke C2, no
+scanner, and Torii-style persistence — so a stock family name doesn't fit cleanly ("Mirai" alone understates
+the rewrite; "Torii," the AV label, is a capability mislabel). A descriptive name beats a borrowed one.
 
 ---
 
-*Static analysis only; the sample was never run. Published for defenders — detection content above is free to
-use.*
+*Static analysis plus a contained lab detonation (isolated, no-egress; the C2 was redirected to a lab sink and
+the sample never contacted the real operator). Detection content above is free for defenders to use.*
