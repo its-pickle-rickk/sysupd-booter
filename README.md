@@ -1,48 +1,59 @@
-# `sysupd` — a Mirai booter in Torii's clothes
+# `sysupd` — not Torii, not Mirai: an original DDoS booter
 
-**TL;DR.** A Linux **DDoS booter** caught in a honeypot. MalwareBazaar labels it **Torii** — it isn't.
-Under the hood it's **Mirai-lineage**: it keeps Mirai's single-instance lock and multi-arch spoofed-flood
-engine, but has had the scanner and config system **stripped out**, a **bespoke plaintext C2 protocol** bolted
-on, and **Torii-style "sysupd" persistence** grafted over the top. The "Torii" name comes from that
-persistence, not from the code's actual lineage. Detection was low (15/74) at capture. Shape-labelled
-**`sysupd-booter`**.
+**TL;DR.** A Linux **DDoS booter** caught in a honeypot, wearing two misleading labels. MalwareBazaar calls it
+**Torii** (off its persistence strings); its `127.0.0.1:48101` single-instance lock screams **Mirai** (that's
+Mirai's port). **Both are wrong.** At the code level it's an **independent, largely-original booter** — its own
+PRNG, checksum, flood routines and dispatch, plus a bespoke plaintext C2. It shares Mirai's *lock-port
+convention*, not its *code*, and shares nothing with Torii but an aggressive persistence style. Detection was
+low (15/74) at capture. Shape-labelled **`sysupd-booter`**.
 
-Analysis below is static RE **plus a contained dynamic detonation** (packet captures of every attack method).
-Nothing was run outside an isolated, no-egress lab.
+Analysis below is static RE + a **contained dynamic detonation** (packet captures of every attack method) + a
+**direct code-diff against the leaked Mirai source**. Nothing was run outside an isolated, no-egress lab.
 
 ---
 
-## Lineage: Mirai, not Torii
+## Two false labels — and why both fail
 
-The giveaway is at runtime: the bot does **`bind(127.0.0.1:48101)`** — Mirai's canonical single-instance lock
-port, inherited from the leaked source, not a number you pick by accident. Add the fork-per-attack worker
-model, the duration-bounded attack children, and the raw-socket spoofed SYN/ACK flood with hand-built headers
-+ checksums, and the attack engine is clearly Mirai-derived.
+This sample is a small case study in labelling malware off a single surface artifact. It carries two, and
+neither survives contact with the code.
 
-What was changed — which is why it doesn't *look* like Mirai to a signature:
+**"Torii" (MalwareBazaar) — a persistence-string mislabel.** Real Torii (Avast, 2018) was a **Go** stealth
+data-exfil **RAT** with encrypted comms and **no DDoS**. The only thing this sample shares with it is the
+aggressive multi-init **"sysupd"** persistence — which is exactly what the AV signature keyed on. This bot is
+not a RAT and exfiltrates nothing; it's a flooder.
 
-| | Stock Mirai | This sample |
+**"Mirai" (the lock port) — a port-number mislabel.** The bot does `bind(127.0.0.1:48101)` — Mirai's canonical
+single-instance lock port, and the *one* concrete Mirai artifact in the whole binary. Tempting to call that
+lineage. But a direct diff against the leaked Mirai source (`mirai/bot/`) says **it is not a Mirai fork (~15%),
+and not even a copy-paste of Mirai's flood code:**
+
+| Component | Mirai | This sample |
 |---|---|---|
-| Single-instance lock | `127.0.0.1:48101` | **`127.0.0.1:48101`** (kept) |
-| Attack engine | UDP + raw-socket floods | **kept** (UDP ×3 + spoofed TCP SYN/ACK ×2) |
-| C2 protocol | `\x00\x00\x00\x01`+id, XOR config table | **replaced** — bespoke plaintext (below) |
-| Scanner / telnet spread | yes | **removed** |
-| Persistence | minimal (memory-resident) | **Torii-style multi-init "sysupd"** |
+| PRNG | xorshift `rand_next` (`t^=t<<11; t^=t>>8; w^=w>>19`) | **glibc `random()`** — the 11/8/19 constants are *absent* |
+| Checksum | `checksum_generic` (word reads, 2-statement fold) | **different** (byte-pair read + looping fold) |
+| TCP flood | `attack_tcp_syn` with a 40-byte TCP-options block | **no TCP options at all** |
+| Dispatch | double-fork + dynamic `attack_parse`/method-table | **single-fork → compiled jump table** |
+| Scanner / XOR config / `\x00\x00\x00\x01` reg | present | **all absent** |
+| `127.0.0.1:48101` lock | yes | **yes — the only shared artifact** |
 
-And it's **not Torii** either: real Torii (Avast, 2018) was a **Go** stealth data-exfil RAT with encrypted
-comms and **no DDoS**. The only thing shared with Torii is the aggressive persistence — which is exactly what
-the AV signature keyed on. Label by capability, not by install strings.
+The PRNG and checksum are the decisive discriminators — distinctive, and essentially never rewritten in a
+genuine fork. Both come back independent. Nobody rewrites the PRNG, the checksum, *and* the whole dispatch
+framework while keeping only a lock port. So: **an independent DDoS booter that cargo-culted Mirai's lock port
+and general flood ideas — not a Mirai variant.**
+
+The takeaway cuts both ways: a persistence string said "Torii," a port number said "Mirai," and the code said
+neither. **Identify by code, not by one constant.**
 
 ## The bespoke-but-plaintext C2 — and why
 
-The author replaced Mirai's C2 with their own protocol, yet left it entirely in the clear. That's not a
-contradiction once you read "bespoke" as *minimal and self-owned*, not *sophisticated*:
+The author wrote their own C2 protocol yet left it entirely in the clear. That's not a contradiction once you
+read "bespoke" as *minimal and self-owned*, not *sophisticated*:
 
-- Obfuscating the C2 (Mirai's XOR config table) is mostly theatre — the bot **must** connect to its C2, so any
-  sandbox run reveals the address regardless. XOR only beats a lazy `strings`.
+- Obfuscating the C2 is mostly theatre — the bot **must** connect to it, so any sandbox run reveals the address
+  regardless. XOR/encryption only beats a lazy `strings`.
 - The evasion here is **novelty, not crypto** — 15/74 on a fresh codebase, *with* a plaintext protocol. No
   signatures exist yet, so plaintext costs nothing.
-- A plaintext, 3-opcode protocol is **easy to operate** — a trivial C2 server, no key management, no crypto bugs.
+- A plaintext, 3-opcode protocol is **easy to operate** — trivial C2 server, no key management, no crypto bugs.
 
 It reads as a booter operator optimising for simplicity and control, not a malware author optimising for
 stealth. The one custom flourish — the CPU-count byte in the beacon — is an *operational* optimisation, not an
@@ -78,8 +89,7 @@ each bot's flood capacity at check-in.
 [15:]   payload
 ```
 
-Note the **two IP fields** — an attack handle (for `0x11` stop) and the actual flood target. (An easy field to
-misread from static analysis alone; the lab run pinned it.)
+Note the **two IP fields** — an attack handle (for `0x11` stop) and the actual flood target.
 
 ## Attack methods (observed on the wire)
 
@@ -116,7 +126,9 @@ A 128-byte high-entropy blob in `.data` (`0x50f3a0`) looks like a key or encrypt
 static **`randtbl`** PRNG initial-state table: the first word is `TYPE_3`, the 128 bytes are byte-for-byte
 identical to upstream glibc, and the region is referenced *only* by the statically-linked `random_r` machinery
 — glibc's `struct random_data` pointers (`state`/`fptr`/`rptr`/`end_ptr`) walk exactly this array. A benign
-libc artefact, flagged here because it's an easy false-positive when you're hunting for a config key.
+libc artefact, flagged because it's an easy false-positive when you're hunting for a config key. (Fittingly,
+this is *also* the only piece of glibc `random()` in the binary — the same fact that proves the flood code
+isn't Mirai's.)
 
 ## Detection
 
@@ -135,7 +147,7 @@ alert tcp any any -> any any ( \
 - Masquerades: process `udhcpc`; install name `sysupd` / `.sysupd`
 - Paths: `/usr/bin/.sysupd`, `/etc/init.d/sysupd`, `/etc/cron.d/sysupd`, `/etc/profile.d/sysupd.sh`,
   `sysupd.service`, `/tmp/.ash.pid`
-- Single-instance lock: `bind 127.0.0.1:48101` (Mirai heritage)
+- Single-instance lock: `bind 127.0.0.1:48101` (cargo-culted Mirai constant — **not** proof of Mirai lineage)
 - Beacon magic: `A1 71 4E 01 02`
 
 **Sample:**
@@ -148,11 +160,12 @@ alert tcp any any -> any any ( \
 ## Naming
 
 No self-ID, version, or author strings in the binary. Named **`sysupd-booter`** after its persistence artefact
-(shape-based). It's **Mirai-lineage by code** (the `48101` lock + the attack engine) but with a bespoke C2, no
-scanner, and Torii-style persistence — so a stock family name doesn't fit cleanly ("Mirai" alone understates
-the rewrite; "Torii," the AV label, is a capability mislabel). A descriptive name beats a borrowed one.
+(shape-based). It's **not a known family**: not Torii (a persistence-string mislabel), not Mirai (a lock-port
+mislabel), and not a fork of either — an independent implementation with a bespoke C2. A descriptive name beats
+two borrowed and wrong ones.
 
 ---
 
-*Static analysis plus a contained lab detonation (isolated, no-egress; the C2 was redirected to a lab sink and
-the sample never contacted the real operator). Detection content above is free for defenders to use.*
+*Static analysis + a contained lab detonation (isolated, no-egress; the C2 was redirected to a lab sink and the
+sample never contacted the real operator) + a code-diff against the leaked Mirai source. Detection content above
+is free for defenders to use.*
